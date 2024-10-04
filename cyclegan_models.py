@@ -11,11 +11,17 @@ from PIL import Image
 from tqdm import tqdm
 import logging
 import os
-
+import itertools
+from diffusers import AutoencoderKL, DDPMScheduler, PNDMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from generator import get_generator
 from discriminator import get_model
 from utils import ImagePool, init_weights, set_requires_grad, load_weights, convert_to_255
 from metrics import get_metric_class, calc_metric
+import bitsandbytes as bnb
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
 #@title CycleGan.py
 class CycleGan(pl.LightningModule):
     def __init__(self, config):
@@ -23,17 +29,10 @@ class CycleGan(pl.LightningModule):
         self.automatic_optimization = False #this has been changed due to automatic optimizer problem.
         self.save_hyperparameters()
         self.config = config
-
-        #stable diffusion
-        self.sd_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained("CompVis/stable-diffusion-v1-4")
-        self.sd_pipeline.safety_checker=None
-        # self.sd_pipeline.set_logging_level(logging.ERROR) 
-        self.sd_pipeline.to(self.config['device'])  # Ensure the model is on the correct device
-        self.sd_pipeline.set_progress_bar_config(leave=False)
-        self.sd_pipeline.set_progress_bar_config(disable=True)
-
-
-
+        self.text_encoder = CLIPTextModel.from_pretrained(config['sd_model'], subfolder="text_encoder")
+        self.vae = AutoencoderKL.from_pretrained(config['sd_model'], subfolder="vae")
+        self.unet = UNet2DConditionModel.from_pretrained(config['sd_model'], subfolder="unet")
+        self.tokenizer = CLIPTokenizer.from_pretrained(config['sd_model'],subfolder="tokenizer")
 
         # Set metrics
         metric_list = config['metrics']        
@@ -113,14 +112,55 @@ class CycleGan(pl.LightningModule):
             ).images[0]
         # Convert the refined image back to a tensor
         refined_tensor = self.image_to_tensor(refined_image).to(self.config['device'])
-        return refined_tensor        
+        return refined_tensor 
+    def diffusion_training(self,imga,imgb):
+        optimizer_class = bnb.optim.AdamW8bit
+        params_to_optimize = (itertools.chain(self.unet.parameters(), self.text_encoder.parameters()) if args.train_text_encoder else unet.parameters())
+        optimizer = optimizer_class(
+        params_to_optimize,
+        lr=5e-06,
+        )     
+        self.unet.train()
+        with accelerator.accumulate(self.unet):
+          # Convert images to latent space
+          latents = self.vae.encode(imga.to(dtype=torch.float32)).latent_dist.sample()
+          latents = latents * 0.18215
+          latents_target=self.vae.encode(imgb.to(dtype=torch.float32)).latent_dist.sample()
+          latents_target.latents_target*0.18215
+
+          # Sample noise that we'll add to the latents
+          noise = torch.randn_like(latents)
+          target=torch.randn_like(latents_target)
+          bsz = latents.shape[0]
+          # Sample a random timestep for each image
+          timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+          timesteps = timesteps.long()
+
+          # Add noise to the latents according to the noise magnitude at each timestep
+          # (this is the forward diffusion process)
+          noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+          # Get the text embedding for conditioning
+          encoder_hidden_states = self.text_encoder('')[0]
+
+          # Predict the noise residual
+          noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+          loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
+          accelerator.backward(loss)
+          optimizer.step()
+          optimizer.zero_grad()
+
+
+
+
     def generator_training_step(self, imgA, imgB):        
         """cycle images - using only generator nets"""
-        fakeB = self.genX(imgA)
+        fakeB = self.diffusion_training(imgA,imgB)
         cycledA = self.genY(fakeB)
         
         fakeA = self.genY(imgB)
-        cycledB = self.genX(fakeA)
+        cycledB = self.diffusion_training(fakeA,imgB)
         
         sameB = self.genX(imgB)
         sameA = self.genY(imgA)
