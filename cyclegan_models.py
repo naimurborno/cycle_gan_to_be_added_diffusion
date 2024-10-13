@@ -114,8 +114,13 @@ class CycleGan(pl.LightningModule):
         refined_tensor = self.image_to_tensor(refined_image).to(self.config['device'])
         return refined_tensor 
     def diffusion_training(self,imga,imgb):
+        accelerator = Accelerator(
+        gradient_accumulation_steps=self.config['gradient_accumulation_steps'],
+        mixed_precision=self.config['mixed_precision'],
+        )
+        noise_scheduler = DDPMScheduler.from_config(self.config['sd_model'], subfolder="scheduler")
         optimizer_class = bnb.optim.AdamW8bit
-        params_to_optimize = (itertools.chain(self.unet.parameters(), self.text_encoder.parameters()) if args.train_text_encoder else unet.parameters())
+        params_to_optimize = (itertools.chain(self.unet.parameters(), self.text_encoder.parameters()) if self.config['text_encoder_train'] else self.unet.parameters())
         optimizer = optimizer_class(
         params_to_optimize,
         lr=5e-06,
@@ -126,19 +131,19 @@ class CycleGan(pl.LightningModule):
           latents = self.vae.encode(imga.to(dtype=torch.float32)).latent_dist.sample()
           latents = latents * 0.18215
           latents_target=self.vae.encode(imgb.to(dtype=torch.float32)).latent_dist.sample()
-          latents_target.latents_target*0.18215
+          latents_target=latents_target*0.18215
 
           # Sample noise that we'll add to the latents
           noise = torch.randn_like(latents)
           target=torch.randn_like(latents_target)
           bsz = latents.shape[0]
           # Sample a random timestep for each image
-          timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+          timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
           timesteps = timesteps.long()
 
           # Add noise to the latents according to the noise magnitude at each timestep
           # (this is the forward diffusion process)
-          noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+          noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
           # Get the text embedding for conditioning
           encoder_hidden_states = self.text_encoder('')[0]
@@ -150,7 +155,29 @@ class CycleGan(pl.LightningModule):
           accelerator.backward(loss)
           optimizer.step()
           optimizer.zero_grad()
+          latents = noisy_latents  # Use the noisy_latents from the forward diffusion process
+          # Denoise the latents step by step from the final timestep to 0
+          for t in reversed(range(noise_scheduler.config.num_train_timesteps)):
+              # Predict the noise at this timestep
+              noise_pred = self.unet(latents, torch.tensor([t], device=latents.device), encoder_hidden_states).sample
+                
+              # Compute the previous latent by removing the predicted noise
+              latents =noise_scheduler.step(noise_pred, t, latents).prev_sample
 
+          # After denoising, latents should be free from noise
+
+          # Decode the final latents back into pixel space
+          latents = latents / 0.18215  # Reverse the scaling applied before encoding
+
+          # Use the VAE decoder to decode latents back to images
+          generated_image = self.vae.decode(latents).sample  # Shape: (batch_size, channels, height, width)
+
+          # Rescale the image to [0, 1] for visualization
+          generated_image = (generated_image / 2 + 0.5).clamp(0, 1)  # Rescale to [0, 1]
+
+          # Optionally convert to CPU and change the format for further processing or visualization
+          generated_image = generated_image.cpu().permute(0, 2, 3, 1).numpy() 
+        return generated_image
 
 
 
@@ -174,8 +201,8 @@ class CycleGan(pl.LightningModule):
         mseGenA = self.get_mse_loss(predFakeA, 'real')
         
         #stable diffusion post-processing
-        fakeB = self.refine_with_stable_diffusion(fakeB)
-        fakeA = self.refine_with_stable_diffusion(fakeA)
+        # fakeB = self.refine_with_stable_diffusion(fakeB)
+        # fakeA = self.refine_with_stable_diffusion(fakeA)
         
         # compute extra losses
         if self.config['identity_loss'] == "mae_loss": 

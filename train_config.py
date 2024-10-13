@@ -15,11 +15,12 @@ config['batch_size']  = 1                   # batch size, Change to fit hardware
 config['n_epochs']  = 1 # old system
 config['n_lin_epoch'] = 100                 # number of epoch for linear learning rate
 config['n_dec_epoch'] = 100                 # number of epoch for learning rate to decay
+config['sd_model'] = "CompVis/stable-diffusion-v1-4"             
 # total epoch =  n_lin_epoch + n_dec_epoch
 config['save_freq'] = 5                     # epochs for saving model weights
 config['gen_model'] = 'resnet_gen_9'        # ['resnet_gen_9','resnet_gen_7','resnet_gen_3']
 config['dis_model'] = 'patchGAN'            # ['patchGAN','pixelGAN']
-
+config['text_encoder_train']=False
 config['dis_loss'] = 'mse_loss'             # Discriminator Loss: "mse_loss" 
 config['gen_loss'] = 'mse_loss'             # Generator Loss: "mse_loss"
 config['identity_loss'] = 'mae_loss'        # Identity Loss: "mae_loss", "mse_loss"
@@ -29,6 +30,8 @@ config['gen_opt'] = 'adam'                  # Generator Optimizer:'adam'
 config['dis_opt'] = 'adam'                  # Discriminator Optimizer:'adam'
 config['gen_lr'] = 2e-4                     # Generator learning rate 
 config['dis_lr'] = 2e-4                     # Generator learning rate 
+config['gradient_accumulation_steps']=2
+config['mixed_precision']="fp16"
 
 ### Metrics to compute
 config["metrics"] = ["fid","psnr"]
